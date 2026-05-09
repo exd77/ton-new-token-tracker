@@ -12,6 +12,8 @@ Telegram bot for tracking newly launched TON tokens from DeDust/x1000 and sendin
 
 ## Preview
 
+When a new token launch is detected, the bot sends a Telegram photo/message like this:
+
 ```text
 $SHITON just launched on TON
 

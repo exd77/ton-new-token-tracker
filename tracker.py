@@ -187,6 +187,8 @@ def format_ton_short(value: Optional[Decimal]) -> str:
 def format_usd(value: Any) -> Optional[str]:
     if value is None or value == "":
         return None
+    if isinstance(value, (dict, list, tuple, set)):
+        return None
     try:
         d = Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
@@ -389,6 +391,17 @@ _SOCIAL_FIELD_KEYS = {
     "website", "site", "homepage", "url", "web",
 }
 _SOCIAL_CONTAINER_KEYS = {"socials", "social", "links", "websites", "external_urls"}
+# Keys that *contain* url/link/site substrings but are not social. These bias
+# the heuristic walker away from media/asset URLs.
+_NON_SOCIAL_HINTS = (
+    "image", "preview", "icon", "logo", "thumb", "avatar", "banner",
+    "asset", "media", "video_url", "audio_url", "address",
+)
+# URL paths ending in these extensions are media, not socials.
+_MEDIA_EXTS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico",
+    ".mp4", ".mov", ".webm", ".mp3", ".wav", ".ogg",
+)
 
 
 def _walk_for_urls(obj: Any, depth: int = 0) -> list[str]:
@@ -401,6 +414,8 @@ def _walk_for_urls(obj: Any, depth: int = 0) -> list[str]:
         out: list[str] = []
         for k, v in obj.items():
             kl = str(k).lower()
+            if any(hint in kl for hint in _NON_SOCIAL_HINTS):
+                continue
             if (
                 kl in _SOCIAL_CONTAINER_KEYS
                 or kl in _SOCIAL_FIELD_KEYS
@@ -417,6 +432,64 @@ def _walk_for_urls(obj: Any, depth: int = 0) -> list[str]:
             out.extend(_walk_for_urls(item, depth + 1))
         return out
     return []
+
+
+def _is_media_url(url: str) -> bool:
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return False
+    return any(path.endswith(ext) for ext in _MEDIA_EXTS)
+
+
+def coin_volume_24h(coin: Optional[dict[str, Any]]) -> Optional[str]:
+    """Pull a sane 24h USD volume from x1000 coin item.
+
+    The x1000 API returns volume as either a plain scalar or a nested
+    dict like {buy_periods:{h24:..}, sell_periods:{h24:..}, total_periods:{h24:..}}.
+    We try total_periods.h24 first, fall back to summed buy+sell, then
+    flat h24, then the scalar form.
+    """
+    if not coin:
+        return None
+    v = coin.get("volume")
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        total = v.get("total_periods")
+        if isinstance(total, dict) and total.get("h24") is not None:
+            return format_usd(total.get("h24"))
+        buy = (v.get("buy_periods") or {}).get("h24") if isinstance(v.get("buy_periods"), dict) else None
+        sell = (v.get("sell_periods") or {}).get("h24") if isinstance(v.get("sell_periods"), dict) else None
+        if buy is not None or sell is not None:
+            try:
+                s = Decimal(str(buy or 0)) + Decimal(str(sell or 0))
+                return format_usd(s)
+            except (InvalidOperation, ValueError, TypeError):
+                pass
+        if v.get("h24") is not None:
+            return format_usd(v.get("h24"))
+        return None
+    return format_usd(v)
+
+
+def coin_tx_24h(coin: Optional[dict[str, Any]]) -> Optional[str]:
+    """Format `Nbuy / Nsell` from x1000 coin transactions.{buy,sell}.h24."""
+    if not coin:
+        return None
+    tx = coin.get("transactions")
+    if not isinstance(tx, dict):
+        return None
+    buy = (tx.get("buy") or {}).get("h24") if isinstance(tx.get("buy"), dict) else None
+    sell = (tx.get("sell") or {}).get("h24") if isinstance(tx.get("sell"), dict) else None
+    if buy is None and sell is None:
+        return None
+    try:
+        b = int(buy or 0)
+        s = int(sell or 0)
+    except (ValueError, TypeError):
+        return None
+    return f"{b} buy / {s} sell"
 
 
 def extract_social_links(
@@ -439,6 +512,8 @@ def extract_social_links(
                 continue
             sl = normalize_social_url(piece)
             if not sl:
+                continue
+            if _is_media_url(sl.url):
                 continue
             key = sl.url.lower().rstrip("/")
             if key in seen:
@@ -693,7 +768,8 @@ class Tracker:
         holders = x1000_coin.get("holders") if x1000_coin else None
         age_str = format_age(x1000_coin.get("created_at") if x1000_coin else None)
         market_cap = format_usd(x1000_coin.get("market_cap") if x1000_coin else None)
-        volume = format_usd(x1000_coin.get("volume") if x1000_coin else None)
+        volume = coin_volume_24h(x1000_coin)
+        tx_24h = coin_tx_24h(x1000_coin)
 
         pool_addr = pool.get("address", "") or ""
         chart_url = self.build_x1000_link(
@@ -777,6 +853,8 @@ class Tracker:
             stats_rows.append(("Market Cap", market_cap))
         if volume:
             stats_rows.append(("Volume 24h", volume))
+        if tx_24h:
+            stats_rows.append(("Tx 24h", tx_24h))
 
         if not stats_rows:
             metadata_by_address = {jetton_addr: metadata} if jetton_addr else {}
